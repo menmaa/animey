@@ -13,9 +13,6 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -33,14 +30,14 @@ type Event struct {
 	URL    string `json:"url"`
 }
 
-type SourceResult struct {
-	EpisodeID     string `json:"episode_id"`
-	EpisodeTitle  string `json:"episode_title"`
-	EpisodeNumber string `json:"episode_number"`
-	SeriesID      string `json:"series_id"`
-	SeriesName    string `json:"series_name"`
-	SeasonNumber  string `json:"season_number"`
-	URL           string `json:"url"`
+type EpisodeResult struct {
+	EpisodeID     string   `json:"episode_id"`
+	EpisodeTitle  string   `json:"episode_title"`
+	EpisodeNumber string   `json:"episode_number"`
+	SeriesID      string   `json:"series_id"`
+	SeriesName    string   `json:"series_name"`
+	SeasonNumber  string   `json:"season_number"`
+	Servers       []string `json:"servers"`
 }
 
 type listItem struct {
@@ -61,8 +58,6 @@ type apiSourceResponse struct {
 
 var (
 	baseLogger *zap.Logger
-	sqsClient  *sqs.Client
-	queueURL   string
 )
 
 func init() {
@@ -77,23 +72,9 @@ func init() {
 	if err != nil {
 		baseLogger = zap.NewNop()
 	}
-
-	cfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		baseLogger.Error("Failed to load AWS config.", zap.Error(err))
-		return
-	}
-
-	sqsClient = sqs.NewFromConfig(cfg)
 }
 
-func Handler(ctx context.Context, event Event) ([]SourceResult, error) {
-	// queueURL = strings.TrimSpace(os.Getenv("DESTINATION_SQS_QUEUE"))
-	// if queueURL == "" {
-	// 	baseLogger.Error("Destination SQS queue not set.", zap.String("env_var", "DESTINATION_SQS_QUEUE"))
-	// 	return nil, errors.New("destination sqs queue not set")
-	// }
-
+func Handler(ctx context.Context, event Event) ([]EpisodeResult, error) {
 	if event.URL == "" {
 		return nil, errors.New("url is required")
 	}
@@ -123,7 +104,7 @@ func Handler(ctx context.Context, event Event) ([]SourceResult, error) {
 		return nil, err
 	}
 
-	results := make([]SourceResult, 0)
+	results := make([]EpisodeResult, 0)
 	for _, item := range items {
 		logger.Info("Processing episode.",
 			zap.String("episode_id", item.DataID),
@@ -136,19 +117,14 @@ func Handler(ctx context.Context, event Event) ([]SourceResult, error) {
 			return nil, err
 		}
 
-		url, err := fetchSourceURL(ctx, client, logger, serverIDs)
-		if err != nil {
-			return nil, err
-		}
-
-		results = append(results, SourceResult{
+		results = append(results, EpisodeResult{
 			EpisodeID:     item.DataID,
 			EpisodeTitle:  item.Title,
 			EpisodeNumber: item.Number,
 			SeriesID:      seriesID,
 			SeriesName:    seriesName,
 			SeasonNumber:  seasonNumber,
-			URL:           url,
+			Servers:       serverIDs,
 		})
 	}
 
@@ -248,7 +224,7 @@ func fetchEpisodeServers(ctx context.Context, client *http.Client, logger *zap.L
 	}
 
 	ids := make([]string, 0)
-	doc.Find(".server-item").Each(func(_ int, s *goquery.Selection) {
+	doc.Find(".server-item[data-type=\"sub\"]").Each(func(_ int, s *goquery.Selection) {
 		id, ok := s.Attr("data-id")
 		if !ok || strings.TrimSpace(id) == "" {
 			return
@@ -262,69 +238,6 @@ func fetchEpisodeServers(ctx context.Context, client *http.Client, logger *zap.L
 	}
 
 	return ids, nil
-}
-
-func fetchSourceURL(ctx context.Context, client *http.Client, logger *zap.Logger, serverIDs []string) (string, error) {
-	for idx, serverID := range serverIDs {
-		url := fmt.Sprintf(sourcesURLQuery, serverID)
-		logger.Debug("Fetching episode source JSON.", zap.String("url", url), zap.String("server_id", serverID))
-
-		var resp apiSourceResponse
-		if err := fetchJSON(ctx, client, url, &resp); err != nil {
-			logger.Error("Episode source fetch failed.",
-				zap.String("server_id", serverID),
-				zap.Error(err),
-			)
-		} else if strings.TrimSpace(resp.Link) == "" {
-			logger.Error("Episode source missing link.", zap.String("server_id", serverID))
-		} else {
-			return resp.Link, nil
-		}
-
-		if idx < len(serverIDs)-1 {
-			logger.Debug("Sleeping before next source attempt.", zap.Duration("sleep", 6*time.Second))
-			time.Sleep(6 * time.Second)
-		}
-	}
-
-	logger.Error("All episode source attempts failed.")
-	return "", errors.New("all episode source attempts failed")
-}
-
-func sendSourceResultToSQS(ctx context.Context, client *sqs.Client, queueURL string, result SourceResult, logger *zap.Logger) error {
-	if client == nil {
-		return errors.New("sqs client is required")
-	}
-
-	if strings.TrimSpace(queueURL) == "" {
-		return errors.New("queue url is required")
-	}
-
-	if logger == nil {
-		logger = zap.NewNop()
-	}
-
-	logger.Debug("Sending SQS message.",
-		zap.String("queue_url", queueURL),
-		zap.String("episode_id", result.EpisodeID),
-	)
-
-	payload, err := json.Marshal(result)
-	if err != nil {
-		logger.Error("Failed to marshal SQS payload.", zap.Error(err))
-		return err
-	}
-
-	_, err = client.SendMessage(ctx, &sqs.SendMessageInput{
-		QueueUrl:    aws.String(queueURL),
-		MessageBody: aws.String(string(payload)),
-	})
-	if err != nil {
-		logger.Error("Failed to send SQS message.", zap.Error(err))
-		return err
-	}
-
-	return nil
 }
 
 func fetchHTMLDoc(ctx context.Context, client *http.Client, url string) (*goquery.Document, error) {
