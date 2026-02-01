@@ -44,11 +44,24 @@ var (
 	accessKeyFallbackRegex = regexp.MustCompile(
 		`window\._lk_db\s*=\s*\{[^}]*x:\s*"([^"]+)"[^}]*y:\s*"([^"]+)"[^}]*z:\s*"([^"]+)"[^}]*\}`,
 	)
-	accessKeyValidRegex = regexp.MustCompile(`^[A-Za-z0-9]{48}$`)
-	numericOnlyRegex    = regexp.MustCompile(`^\d+$`)
-	logger              *zap.Logger
-	s3Client            *s3.Client
+	accessKeyValidRegex  = regexp.MustCompile(`^[A-Za-z0-9]{48}$`)
+	numericOnlyRegex     = regexp.MustCompile(`^\d+$`)
+	logger               *zap.Logger
+	s3Client             *s3.Client
+	s3OutputBucket       = strings.TrimSpace(os.Getenv("S3_OUTPUT_BUCKET"))
+	s3OutputPrefix       = strings.Trim(strings.TrimSpace(os.Getenv("S3_OUTPUT_PREFIX")), "/")
+	s3OutputStorageClass = strings.TrimSpace(os.Getenv("S3_OUTPUT_STORAGE_CLASS"))
 )
+
+type EpisodeObject struct {
+	EpisodeID     string   `json:"episode_id"`
+	EpisodeTitle  string   `json:"episode_title"`
+	EpisodeNumber string   `json:"episode_number"`
+	SeriesID      string   `json:"series_id"`
+	SeriesName    string   `json:"series_name"`
+	SeasonNumber  string   `json:"season_number"`
+	Servers       []string `json:"servers"`
+}
 
 type MegacloudPlayerAttributes struct {
 	DataID  string
@@ -98,6 +111,15 @@ func init() {
 		return
 	}
 	s3Client = s3.NewFromConfig(cfg)
+
+	if s3OutputBucket == "" {
+		logger.Error("S3_OUTPUT_BUCKET not set.")
+		return
+	}
+
+	if s3OutputStorageClass == "" {
+		s3OutputStorageClass = "STANDARD"
+	}
 }
 
 func main() {
@@ -113,40 +135,33 @@ func run() error {
 		Timeout: 10 * time.Second,
 	}
 
-	destinationBucket := strings.TrimSpace(os.Getenv("S3_OUTPUT_BUCKET"))
-	if destinationBucket == "" {
-		logger.Error("S3_OUTPUT_BUCKET not set.")
-		return errors.New("output bucket not set")
-	}
-	outputPrefix := strings.Trim(strings.TrimSpace(os.Getenv("S3_OUTPUT_PREFIX")), "/")
-
 	payload, err := parseEpisodeMessage(os.Getenv("INPUT_RECORD"))
 	if err != nil {
-		logger.Error("Failed to parse SQS payload.", zap.Error(err))
+		logger.Error("Failed to parse input payload.", zap.Error(err))
 		return err
 	}
 
-	objectKey, err := buildEpisodeObjectKey(payload, outputPrefix)
+	mediaObjectKey, subtitlesObjectKey, err := buildEpisodeObjectKey(payload)
 	if err != nil {
 		logger.Error("Failed to build output key.", zap.Error(err))
 		return err
 	}
 
 	for _, server := range payload.Servers {
-		logger.Debug("Processing episode URL.", zap.String("url", server))
-		if err := processURL(context.Background(), client, destinationBucket, objectKey, server); err != nil {
-			logger.Warn("Processing URL failed. Trying next available URL...", zap.Error(err))
+		logger.Debug("Processing episode media.", zap.String("server_url", server))
+		if err := processMedia(context.Background(), client, server, mediaObjectKey, subtitlesObjectKey); err != nil {
+			logger.Warn("Processing media failed. Trying next available server...", zap.Error(err))
 			continue
 		}
 
 		return nil
 	}
 
-	logger.Error("All available URLs failed to process.")
-	return errors.New("all available urls failed to process.")
+	logger.Error("No available media servers left.")
+	return errors.New("no available media servers left")
 }
 
-func processURL(ctx context.Context, client *http.Client, outputBucket, outputKey, serverID string) error {
+func processMedia(ctx context.Context, client *http.Client, serverID, mediaObjectKey, subtitlesObjectKey string) error {
 	logger.Info("Processing episode download.", zap.String("server_id", serverID))
 	if strings.TrimSpace(serverID) == "" {
 		return errors.New("server_id is required")
@@ -205,6 +220,7 @@ func processURL(ctx context.Context, client *http.Client, outputBucket, outputKe
 		return err
 	}
 
+	logger.Debug("Selecting default subtitle track.")
 	subtitleTrackURL, err := defaultSubtitlesSourceURL(sources.Tracks)
 	if err != nil {
 		logger.Warn("No default subtitle track found.")
@@ -231,21 +247,24 @@ func processURL(ctx context.Context, client *http.Client, outputBucket, outputKe
 		return err
 	}
 
-	logger.Info("Downloading episode...", zap.String("playlist_url", playlistURL), zap.String("subtitle_track", subtitleTrackURL))
-	filePath, err := downloadEpisode(playlistURL, subtitleTrackURL, origin, referer)
+	logger.Info("Downloading episode...", zap.String("playlist_url", playlistURL))
+	mediaOutputPath, err := downloadEpisode(ctx, playlistURL, mediaObjectKey, origin, referer)
 	if err != nil {
 		logger.Error("Downloading episode failed.", zap.Error(err))
 		return err
 	}
 
-	logger.Info("Uploading to S3...", zap.String("file_path", filePath))
-	outputPath, err := uploadEpisodeToS3(ctx, filePath, outputBucket, outputKey)
-	if err != nil {
-		logger.Error("Uploading to S3 failed.", zap.Error(err))
-		return err
+	var subtitlesOutputPath string
+	if subtitleTrackURL != "" {
+		logger.Debug("Downloading subtitles...", zap.String("subtitle_track", subtitleTrackURL))
+		subtitlesOutputPath, err = downloadSubtitles(ctx, subtitleTrackURL, subtitlesObjectKey, origin, referer)
+		if err != nil {
+			logger.Error("Downloading episode failed.", zap.Error(err))
+			return err
+		}
 	}
 
-	logger.Info("Episode processed.", zap.String("s3_output_path", outputPath))
+	logger.Info("Episode processed.", zap.String("s3_media_output_path", mediaOutputPath), zap.String("s3_subtitles_output_path", subtitlesOutputPath))
 	return nil
 }
 
@@ -327,66 +346,56 @@ func fetchJSON(ctx context.Context, client *http.Client, requestURL string, targ
 	return decoder.Decode(target)
 }
 
-type episodeMessage struct {
-	EpisodeID     string   `json:"episode_id"`
-	EpisodeTitle  string   `json:"episode_title"`
-	EpisodeNumber string   `json:"episode_number"`
-	SeriesID      string   `json:"series_id"`
-	SeriesName    string   `json:"series_name"`
-	SeasonNumber  string   `json:"season_number"`
-	Servers       []string `json:"servers"`
-}
-
-func parseEpisodeMessage(record string) (episodeMessage, error) {
+func parseEpisodeMessage(record string) (EpisodeObject, error) {
 	body := strings.TrimSpace(record)
 	if body == "" {
-		return episodeMessage{}, errors.New("record body is empty")
+		return EpisodeObject{}, errors.New("record body is empty")
 	}
 
-	var payload episodeMessage
+	var payload EpisodeObject
 	if err := json.Unmarshal([]byte(body), &payload); err != nil {
-		return episodeMessage{}, err
+		return EpisodeObject{}, err
 	}
 	if strings.TrimSpace(payload.SeriesName) == "" {
-		return episodeMessage{}, errors.New("payload series_name is required")
+		return EpisodeObject{}, errors.New("payload series_name is required")
 	}
 	if strings.TrimSpace(payload.SeasonNumber) == "" {
-		return episodeMessage{}, errors.New("payload season_number is required")
+		return EpisodeObject{}, errors.New("payload season_number is required")
 	}
 	if strings.TrimSpace(payload.EpisodeNumber) == "" {
-		return episodeMessage{}, errors.New("payload episode_number is required")
+		return EpisodeObject{}, errors.New("payload episode_number is required")
 	}
 	if strings.TrimSpace(payload.EpisodeTitle) == "" {
-		return episodeMessage{}, errors.New("payload episode_title is required")
+		return EpisodeObject{}, errors.New("payload episode_title is required")
 	}
 	if len(payload.Servers) == 0 {
-		return episodeMessage{}, errors.New("at least 1 server url is required")
+		return EpisodeObject{}, errors.New("at least 1 server url is required")
 	}
 
 	return payload, nil
 }
 
-func buildEpisodeObjectKey(payload episodeMessage, outputPrefix string) (string, error) {
+func buildEpisodeObjectKey(payload EpisodeObject) (string, string, error) {
 	seasonValue, err := strconv.Atoi(strings.TrimSpace(payload.SeasonNumber))
 	if err != nil {
-		return "", fmt.Errorf("season_number must be numeric: %w", err)
+		return "", "", fmt.Errorf("season_number must be numeric: %w", err)
 	}
 	episodeValue, err := strconv.Atoi(strings.TrimSpace(payload.EpisodeNumber))
 	if err != nil {
-		return "", fmt.Errorf("episode_number must be numeric: %w", err)
+		return "", "", fmt.Errorf("episode_number must be numeric: %w", err)
 	}
 
 	seriesName := strings.TrimSpace(payload.SeriesName)
 	episodeTitle := strings.TrimSpace(payload.EpisodeTitle)
 	if seriesName == "" || episodeTitle == "" {
-		return "", errors.New("series_name and episode_title are required")
+		return "", "", errors.New("series_name and episode_title are required")
 	}
 
 	seasonNumber := strconv.Itoa(seasonValue)
 	seasonPadded := fmt.Sprintf("%02d", seasonValue)
 	episodePadded := fmt.Sprintf("%02d", episodeValue)
 
-	key := fmt.Sprintf(
+	mediaKey := fmt.Sprintf(
 		"%s/Season %s/%s S%sE%s %s.mp4",
 		seriesName,
 		seasonNumber,
@@ -396,11 +405,12 @@ func buildEpisodeObjectKey(payload episodeMessage, outputPrefix string) (string,
 		episodeTitle,
 	)
 
-	if strings.TrimSpace(outputPrefix) != "" {
-		key = path.Join(strings.Trim(outputPrefix, "/"), key)
+	if strings.TrimSpace(s3OutputPrefix) != "" {
+		mediaKey = path.Join(strings.Trim(s3OutputPrefix, "/"), mediaKey)
 	}
+	subtitleKey := strings.Replace(mediaKey, ".mp4", ".srt", 1)
 
-	return key, nil
+	return mediaKey, subtitleKey, nil
 }
 
 func fetchText(ctx context.Context, client *http.Client, requestURL, origin, referer string) (string, *url.URL, error) {
@@ -671,17 +681,13 @@ func resolvePlaylistURL(baseURL *url.URL, uri string) (string, error) {
 	return baseURL.ResolveReference(parsed).String(), nil
 }
 
-func downloadEpisode(videoUrl, subtitlesUrl, origin, referer string) (string, error) {
+func downloadEpisode(ctx context.Context, videoUrl, outputKey, origin, referer string) (string, error) {
 	videoUrl = strings.TrimSpace(videoUrl)
-	subtitlesUrl = strings.TrimSpace(subtitlesUrl)
 	origin = strings.TrimSpace(origin)
 	referer = strings.TrimSpace(referer)
 
 	if videoUrl == "" {
 		return "", errors.New("videoUrl is required")
-	}
-	if subtitlesUrl == "" {
-		return "", errors.New("subtitlesUrl is required")
 	}
 	if origin == "" {
 		return "", errors.New("origin is required")
@@ -702,13 +708,8 @@ func downloadEpisode(videoUrl, subtitlesUrl, origin, referer string) (string, er
 		"-user_agent", userAgentHeader,
 		"-icy", "0",
 		"-i", videoUrl,
-		"-i", subtitlesUrl,
-		"-map", "0:v",
-		"-map", "0:a",
-		"-map", "1:0",
 		"-c:v", "copy",
 		"-c:a", "copy",
-		"-c:s", "mov_text",
 		outputPath,
 	}
 
@@ -720,10 +721,105 @@ func downloadEpisode(videoUrl, subtitlesUrl, origin, referer string) (string, er
 		return "", fmt.Errorf("ffmpeg failed: %w: %s", err, string(out))
 	}
 	logger.Debug("ffmpeg completed.", zap.String("output_path", outputPath))
-	return outputPath, nil
+
+	logger.Debug("Uploading to S3...", zap.String("file_path", outputPath))
+	s3OutputPath, err := s3MultipartUpload(ctx, outputPath, s3OutputBucket, outputKey)
+	if err != nil {
+		logger.Error("Uploading to S3 failed.", zap.Error(err))
+		return "", err
+	}
+
+	return s3OutputPath, nil
 }
 
-func uploadEpisodeToS3(ctx context.Context, filePath, bucket, key string) (string, error) {
+func downloadSubtitles(ctx context.Context, subtitlesUrl, outputKey, origin, referer string) (string, error) {
+	subtitlesUrl = strings.TrimSpace(subtitlesUrl)
+	origin = strings.TrimSpace(origin)
+	referer = strings.TrimSpace(referer)
+
+	if subtitlesUrl == "" {
+		return "", errors.New("subtitlesUrl is required")
+	}
+	if origin == "" {
+		return "", errors.New("origin is required")
+	}
+	if referer == "" {
+		return "", errors.New("referer is required")
+	}
+
+	outputPath := fmt.Sprintf("/tmp/animey_%d.srt", time.Now().UnixNano())
+
+	headers := fmt.Sprintf("Origin: %s\r\nReferer: %s\r\n", origin, referer)
+
+	args := []string{
+		"-protocol_whitelist", "file,http,https,tcp,tls",
+		"-headers", headers,
+		"-user_agent", userAgentHeader,
+		"-icy", "0",
+		"-i", subtitlesUrl,
+		"-c:s", "srt",
+		outputPath,
+	}
+
+	logger.Sugar().Debugf("Executing command: ffmpeg %s", strings.Join(args, " "))
+	cmd := exec.Command("ffmpeg", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Error("ffmpeg failed.", zap.Error(err), zap.ByteString("output", out))
+		return "", fmt.Errorf("ffmpeg failed: %w: %s", err, string(out))
+	}
+	logger.Debug("ffmpeg completed.", zap.String("output_path", outputPath))
+
+	logger.Debug("Uploading to S3...", zap.String("file_path", outputPath))
+	s3OutputPath, err := s3PutObject(ctx, outputPath, s3OutputBucket, outputKey)
+	if err != nil {
+		logger.Error("Uploading to S3 failed.", zap.Error(err))
+		return "", err
+	}
+
+	return s3OutputPath, nil
+}
+
+func s3PutObject(ctx context.Context, filePath, bucket, key string) (string, error) {
+	if s3Client == nil {
+		return "", errors.New("s3 client is not initialized")
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return "", errors.New("file path is required")
+	}
+	if strings.TrimSpace(bucket) == "" {
+		return "", errors.New("bucket is required")
+	}
+	if strings.TrimSpace(key) == "" {
+		return "", errors.New("key is required")
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat file: %w", err)
+	}
+
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(bucket),
+		Key:           aws.String(key),
+		Body:          f,
+		ContentLength: aws.Int64(fi.Size()),
+		StorageClass:  s3types.StorageClass(s3OutputStorageClass),
+	})
+	if err != nil {
+		return "", fmt.Errorf("put object: %w", err)
+	}
+
+	return fmt.Sprintf("s3://%s/%s", bucket, key), nil
+}
+
+func s3MultipartUpload(ctx context.Context, filePath, bucket, key string) (string, error) {
 	if s3Client == nil {
 		return "", errors.New("s3 client is not initialized")
 	}
@@ -748,7 +844,7 @@ func uploadEpisodeToS3(ctx context.Context, filePath, bucket, key string) (strin
 	createOutput, err := s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:       aws.String(bucket),
 		Key:          aws.String(key),
-		StorageClass: s3types.StorageClass("ONEZONE_IA"),
+		StorageClass: s3types.StorageClass(s3OutputStorageClass),
 	})
 	if err != nil {
 		return "", fmt.Errorf("create multipart upload: %w", err)
